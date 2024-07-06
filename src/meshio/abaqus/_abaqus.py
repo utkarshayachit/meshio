@@ -6,6 +6,8 @@ import pathlib
 from itertools import count
 
 import numpy as np
+import logging
+import os
 
 from ..__about__ import __version__
 from .._common import num_nodes_per_cell
@@ -107,8 +109,24 @@ def read(filename):
         out = read_buffer(f)
     return out
 
-
 def read_buffer(f):
+    parts = read_buffer_multi(f)
+    if isinstance(parts, Mesh):
+        return parts
+    else:
+        # just return the first part
+        partname = os.environ.get("MESHIO_ABAQUS_PART_NAME")
+        if len(parts) > 1 and partname is None:
+            keys = list(parts.keys())
+            partname = keys[0]
+            logging.warning(f"Only processing part/assembly '{partname}'. Use environment variable `MESHIO_ABAQUS_PART_NAME` to override. Available: {keys}")
+        elif partname is None:
+            partname = list(parts.keys())[0]
+        if partname not in parts:
+            raise RuntimeError(f"Invalid part/assembly name '{partname}'")
+        return parts[partname]
+
+def read_buffer_multi(f):
     # Initialize the optional data fields
     points = []
     cells = []
@@ -122,6 +140,11 @@ def read_buffer(f):
     point_data = {}
     point_ids = None
 
+    parts = {}
+    part_name = None
+
+    assemblies = {}
+
     line = f.readline()
     while True:
         if not line:  # EOF
@@ -133,8 +156,44 @@ def read_buffer(f):
             continue
 
         keyword = line.partition(",")[0].strip().replace("*", "").upper()
-        if keyword == "NODE":
+        if keyword == "PART":
+            params_map = get_param_map(line, required_keys=["NAME"])
+            print("reading  part", params_map["NAME"])
+            part_name = params_map["NAME"]
+            line = f.readline()
+        elif keyword == "END PART":
+            line = f.readline()
+            m = Mesh(
+                    points,
+                    cells,
+                    point_data=point_data,
+                    cell_data=cell_data,
+                    field_data=field_data,
+                    # point_sets=point_sets,
+                    # cell_sets=cell_sets,
+                )
+            parts[part_name] = m
+
+            # reset all datastructures
+            part_name = None
+            points = []
+            cells = []
+            cell_ids = []
+            point_sets = {}
+            cell_sets = {}
+            cell_sets_element = {}  # Handle cell sets defined in ELEMENT
+            cell_sets_element_order = []  # Order of keys is not preserved in Python 3.5
+            field_data = {}
+            cell_data = {}
+            point_data = {}
+            point_ids = None
+            # print("end part")
+        elif keyword == "NODE":
+            # print("read node")
             points, point_ids, line = _read_nodes(f)
+        elif keyword == "ASSEMBLY":
+            assemblies = _read_assembly(f, parts)
+            line = f.readline()
         elif keyword == "ELEMENT":
             if point_ids is None:
                 raise ReadError("Expected NODE before ELEMENT")
@@ -217,6 +276,12 @@ def read_buffer(f):
                 cell_sets[name].append(
                     cell_sets_element[name] if i == ic else np.array([], dtype="int32")
                 )
+
+    if assemblies:
+        return assemblies
+
+    if parts:
+        return parts
 
     return Mesh(
         points,
@@ -398,6 +463,108 @@ def _read_set(f, params_map):
         set_ids = np.arange(set_ids[0], set_ids[1] + 1, set_ids[2], dtype="int32")
     return set_ids, set_names, line
 
+def _read_assembly(f, parts):
+    assemblies = {}
+
+    line = f.readline()
+    while True:
+        if not line:  # EOF
+            break
+
+        # Comments
+        if line.startswith("**"):
+            line = f.readline()
+            continue
+
+        keyword = line.partition(",")[0].strip().replace("*", "").upper()
+        if keyword == "END ASSEMBLY":
+            break
+        elif keyword == "INSTANCE":
+            params_map = get_param_map(line, required_keys=["NAME", "PART"])
+            if params_map["PART"] not in parts:
+                raise RuntimeError("Unknown part identified in assembly", params_map["PART"])
+            instance = parts[params_map["PART"]]
+            translation, rotation, line = _read_instance(f)
+            if rotation and len(rotation) == 7:
+                instance.points = _transform_coordinates(instance.points, np.asarray(rotation[:3]), np.asarray(rotation[3:6]), rotation[6]) + np.asarray(translation)
+            assemblies[params_map["NAME"]] = instance
+        else:
+            line = f.readline()
+ 
+    return assemblies
+
+def _read_instance(f):
+    values = []
+    while True:
+        line = f.readline()
+        if not line or line.startswith("*"):
+            break
+        if line.strip() == "":
+            continue
+        line = line.strip().strip(",").split(",")
+        values += [float(k) for k in line]
+    return values[:3], values[3:], line
+
+def _transform_coordinates(coords, P1, P2, theta_deg):
+    """
+    Transform the given coordinates by translating, rotating around a specified axis,
+    and then translating back.
+
+    Parameters:
+    coords (np.ndarray): Array of coordinates to be transformed (Nx3).
+    P1 (np.ndarray): Reference point (origin of the transformation) as a 1x3 array.
+    P2 (np.ndarray): Direction point (defines the axis of rotation) as a 1x3 array.
+    theta_deg (float): Rotation angle in degrees.
+
+    Returns:
+    np.ndarray: Transformed coordinates.
+    """
+    
+    # Compute the unit vector for the axis of rotation
+    u = P2 - P1
+    u = u / np.linalg.norm(u)
+
+    # Convert the angle to radians
+    theta_rad = np.deg2rad(theta_deg)
+
+    # Define the rotation matrix components
+    cos_theta = np.cos(theta_rad)
+    sin_theta = np.sin(theta_rad)
+    ux, uy, uz = u
+
+    # Compute the rotation matrix
+    R = np.array([
+        [cos_theta + ux**2 * (1 - cos_theta), ux * uy * (1 - cos_theta) - uz * sin_theta, ux * uz * (1 - cos_theta) + uy * sin_theta],
+        [uy * ux * (1 - cos_theta) + uz * sin_theta, cos_theta + uy**2 * (1 - cos_theta), uy * uz * (1 - cos_theta) - ux * sin_theta],
+        [uz * ux * (1 - cos_theta) - uy * sin_theta, uz * uy * (1 - cos_theta) + ux * sin_theta, cos_theta + uz**2 * (1 - cos_theta)]
+    ])
+
+    # Define the translation matrix (to the origin P1)
+    T = np.eye(4)
+    T[:3, 3] = P1
+
+    # Define the inverse translation matrix (back to the original position)
+    T_inv = np.eye(4)
+    T_inv[:3, 3] = -P1
+
+    # Combine the rotation matrix into a 4x4 matrix for homogeneous coordinates
+    R_homogeneous = np.eye(4)
+    R_homogeneous[:3, :3] = R
+
+    # Compute the combined transformation matrix
+    M = np.dot(np.dot(T, R_homogeneous), T_inv)
+
+    # Convert input coordinates to homogeneous coordinates
+    coords_homogeneous = np.ones((coords.shape[0], 4))
+    coords_homogeneous[:, :3] = coords
+
+    # Apply the transformation
+    transformed_coords_homogeneous = np.dot(M, coords_homogeneous.T).T
+
+    # Convert back to 3D coordinates
+    transformed_coords = transformed_coords_homogeneous[:, :3]
+
+    return transformed_coords
 
 def write(
     filename, mesh: Mesh, float_fmt: str = ".16e", translate_cell_names: bool = True
